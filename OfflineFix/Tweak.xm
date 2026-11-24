@@ -67,16 +67,18 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
 - (void)refreshAudioFiles {
     %orig;
 
+    id downloadsController = (id)self;
+
     id selectedPlaylist = nil;
     @try {
-        selectedPlaylist = [self valueForKey:@"selectedPlaylistFilter"];
+        selectedPlaylist = [downloadsController valueForKey:@"selectedPlaylistFilter"];
     } @catch (__unused NSException *exception) {
     }
     if ([selectedPlaylist isKindOfClass:[NSString class]] && [selectedPlaylist length] > 0) return;
 
     NSArray<NSString *> *audioFiles = nil;
     @try {
-        audioFiles = [self valueForKey:@"audioFiles"];
+        audioFiles = [downloadsController valueForKey:@"audioFiles"];
     } @catch (__unused NSException *exception) {
         return;
     }
@@ -94,7 +96,7 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
     }];
 
     @try {
-        [self setValue:[sorted mutableCopy] forKey:@"audioFiles"];
+        [downloadsController setValue:[sorted mutableCopy] forKey:@"audioFiles"];
     } @catch (__unused NSException *exception) {
     }
 }
