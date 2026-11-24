@@ -96,7 +96,11 @@ static id YTMFixSafeAncestorHelper(id object, NSMutableSet *visited, NSUInteger 
         return nil;
     }
     if (YTMFixClassIsSubclassOf(objectClass, [UIViewController class])) {
-        return object;
+        Method viewMethod = class_getInstanceMethod(objectClass, @selector(view));
+        if (viewMethod != NULL) return object;
+        YTMFixLog(@"safe ancestor skipped controller without view method depth=%lu",
+                  (unsigned long)depth);
+        return nil;
     }
 
     SEL rootSelector = @selector(rootViewController);
