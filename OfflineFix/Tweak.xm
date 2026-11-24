@@ -8,6 +8,7 @@
 
 @class YTMFixDownloadItem;
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
+static NSString *const YTMFixBuildMarker = @"Offline Stability Fix: V5 · hook-active check";
 static YTMFixDownloadItem *YTMFixActiveDownloadItem;
 static BOOL YTMFixQueuePaused;
 static BOOL YTMFixAncestorHelperHookInstalled;
@@ -248,6 +249,20 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
         [downloadsController setValue:[sorted mutableCopy] forKey:@"audioFiles"];
     } @catch (__unused NSException *exception) {
     }
+}
+
+%end
+
+// The existing YTMusicUltimate preferences screen is the least invasive
+// place to expose the loaded overlay version. It leaves all settings and
+// playback UI untouched while making an update immediately identifiable.
+%hook YTMUltimateSettingsController
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    NSString *originalFooter = %orig;
+    if (section != 3) return originalFooter;
+    if (originalFooter.length == 0) return YTMFixBuildMarker;
+    return [originalFooter stringByAppendingFormat:@"\n%@", YTMFixBuildMarker];
 }
 
 %end
