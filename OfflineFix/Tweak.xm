@@ -262,9 +262,10 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
         item.start = ^{
             YTMFixDownloadItem *strongItem = weakItem;
             if (!strongItem) return;
-            %orig(videoId, title, playlistName, ^{
+            void (^downloadCompletion)(void) = ^{
                 YTMFixFinishItem(strongItem, @"completion");
-            });
+            };
+            %orig(videoId, title, playlistName, downloadCompletion);
         };
         [YTMFixQueuedVideoIDs() addObject:videoId];
         [YTMFixDownloadQueue() addObject:item];
