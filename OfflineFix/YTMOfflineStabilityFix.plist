@@ -1,0 +1,8 @@
+{
+    Filter = {
+        Bundles = (
+            "com.google.ios.youtubemusic"
+        );
+    };
+}
+
