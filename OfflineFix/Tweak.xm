@@ -78,6 +78,7 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
                          videoId:(NSString *)videoId
                            title:(NSString *)title
                           author:(NSString *)author {
+    YTMFixLog(@"metadata completion hook invoked");
     %orig;
     YTMFixRecordCompletion(fileName);
 }
@@ -87,6 +88,7 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
 %hook YTMDownloads
 
 - (void)refreshAudioFiles {
+    YTMFixLog(@"downloads refresh hook invoked");
     %orig;
 
     id downloadsController = (id)self;
