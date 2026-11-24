@@ -1,10 +1,20 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include <stdarg.h>
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#include <string.h>
 
 @class YTMFixDownloadItem;
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
 static YTMFixDownloadItem *YTMFixActiveDownloadItem;
+static BOOL YTMFixQueuePaused;
+
+typedef id (*YTMFixAncestorHelperType)(id object, id visited, NSUInteger depth);
+static YTMFixAncestorHelperType YTMFixOriginalAncestorHelper;
+
+extern void MSHookFunction(void *symbol, void *replace, void **result);
 
 static dispatch_queue_t YTMFixLogQueue(void) {
     static dispatch_queue_t queue;
@@ -57,6 +67,100 @@ static void YTMFixRecordCompletion(NSString *fileName) {
         dates[fileName] = @([NSDate date].timeIntervalSince1970);
         [[NSUserDefaults standardUserDefaults] setObject:dates forKey:YTMFixCompletionDatesKey];
     }
+}
+
+static BOOL YTMFixClassIsSubclassOf(Class cls, Class parent) {
+    if (cls == Nil || parent == Nil) return NO;
+    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
+        if (current == parent) return YES;
+    }
+    return NO;
+}
+
+// The installed YTMusicUltimate helper at offset 0xe10c recursively searches
+// arbitrary objects and eventually sends -view after a loose respondsToSelector:
+// check. Replace that one helper by address, rather than changing NSProxy
+// globally, and only traverse concrete UIKit/Foundation container types.
+static id YTMFixSafeAncestorHelper(id object, NSMutableSet *visited, NSUInteger depth) {
+    if (object == nil || depth > 12) return nil;
+
+    Class objectClass = object_getClass(object);
+    if (objectClass == Nil) return nil;
+
+    NSValue *marker = [NSValue valueWithPointer:(__bridge const void *)object];
+    if (visited != nil && [visited containsObject:marker]) return nil;
+    if (visited != nil) [visited addObject:marker];
+
+    if (YTMFixClassIsSubclassOf(objectClass, [NSProxy class])) {
+        YTMFixLog(@"safe ancestor skipped NSProxy depth=%lu", (unsigned long)depth);
+        return nil;
+    }
+    if (YTMFixClassIsSubclassOf(objectClass, [UIViewController class])) {
+        return object;
+    }
+
+    SEL rootSelector = @selector(rootViewController);
+    if (YTMFixClassIsSubclassOf(objectClass, [UIWindow class])) {
+        Method rootMethod = class_getInstanceMethod(objectClass, rootSelector);
+        IMP rootImplementation = rootMethod ? method_getImplementation(rootMethod) : NULL;
+        if (rootImplementation != NULL) {
+            id root = ((id (*)(id, SEL))rootImplementation)(object, rootSelector);
+            return YTMFixSafeAncestorHelper(root, visited, depth + 1);
+        }
+        return nil;
+    }
+
+    SEL responderSelector = @selector(nextResponder);
+    if (YTMFixClassIsSubclassOf(objectClass, [UIView class])) {
+        Method responderMethod = class_getInstanceMethod(objectClass, responderSelector);
+        IMP responderImplementation = responderMethod ? method_getImplementation(responderMethod) : NULL;
+        if (responderImplementation != NULL) {
+            id responder = ((id (*)(id, SEL))responderImplementation)(object, responderSelector);
+            return YTMFixSafeAncestorHelper(responder, visited, depth + 1);
+        }
+        return nil;
+    }
+
+    if (YTMFixClassIsSubclassOf(objectClass, [NSDictionary class])) {
+        for (id value in [(NSDictionary *)object allValues]) {
+            id result = YTMFixSafeAncestorHelper(value, visited, depth + 1);
+            if (result != nil) return result;
+        }
+        return nil;
+    }
+    if (YTMFixClassIsSubclassOf(objectClass, [NSArray class]) ||
+        YTMFixClassIsSubclassOf(objectClass, [NSSet class])) {
+        for (id value in (id<NSFastEnumeration>)object) {
+            id result = YTMFixSafeAncestorHelper(value, visited, depth + 1);
+            if (result != nil) return result;
+        }
+    }
+    return nil;
+}
+
+static void YTMFixInstallAncestorHelperHook(void) {
+    static BOOL installed;
+    if (installed) return;
+
+    for (uint32_t index = 0; index < _dyld_image_count(); index++) {
+        const char *imageName = _dyld_get_image_name(index);
+        if (imageName == NULL || strstr(imageName, "/YTMusicUltimate.dylib") == NULL) continue;
+
+        uintptr_t targetAddress = (uintptr_t)_dyld_get_image_header(index) + 0xe10c;
+        uint32_t signature = *(uint32_t *)targetAddress;
+        if (signature != 0xa9ba6ffc) {
+            YTMFixLog(@"safe ancestor hook skipped signature=%08x", signature);
+            return;
+        }
+
+        MSHookFunction((void *)targetAddress,
+                       (void *)YTMFixSafeAncestorHelper,
+                       (void **)&YTMFixOriginalAncestorHelper);
+        installed = YES;
+        YTMFixLog(@"safe ancestor helper installed offset=0xe10c");
+        return;
+    }
+    YTMFixLog(@"safe ancestor helper target not found");
 }
 
 static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
@@ -173,9 +277,19 @@ static void YTMFixSetActiveItem(YTMFixDownloadItem *item) {
 }
 
 static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason);
+static dispatch_queue_t YTMFixQueueStateQueue(void);
+
+static void YTMFixCancelActiveItem(void) {
+    dispatch_async(YTMFixQueueStateQueue(), ^{
+        YTMFixDownloadItem *item = YTMFixActiveItem();
+        if (item == nil || item.finished) return;
+        YTMFixLog(@"queue cancellation confirmed seq=%lu", (unsigned long)item.sequence);
+        YTMFixFinishItem(item, @"cancelled");
+    });
+}
 
 static void YTMFixStartNextItem(void) {
-    if (YTMFixActiveItem() != nil || YTMFixDownloadQueue().count == 0) return;
+    if (YTMFixQueuePaused || YTMFixActiveItem() != nil || YTMFixDownloadQueue().count == 0) return;
 
     YTMFixDownloadItem *item = YTMFixDownloadQueue().firstObject;
     YTMFixSetActiveItem(item);
@@ -194,8 +308,11 @@ static void YTMFixStartNextItem(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * 60 * NSEC_PER_SEC)),
                        YTMFixQueueStateQueue(), ^{
             if (!item.finished) {
-                YTMFixLog(@"queue timeout seq=%lu", (unsigned long)item.sequence);
-                YTMFixFinishItem(item, @"timeout");
+                // A watchdog is diagnostic only. Never signal completion or
+                // start another item while the underlying download is alive.
+                YTMFixQueuePaused = YES;
+                YTMFixLog(@"queue paused seq=%lu reason=timeout; active download retained; no next track",
+                          (unsigned long)item.sequence);
             }
         });
     });
@@ -205,6 +322,7 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
     dispatch_async(YTMFixQueueStateQueue(), ^{
         if (item.finished) return;
         item.finished = YES;
+        YTMFixQueuePaused = NO;
         if (YTMFixDownloadQueue().firstObject == item) {
             [YTMFixDownloadQueue() removeObjectAtIndex:0];
         } else {
@@ -229,6 +347,15 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
         });
     });
 }
+
+%hook FFMpegDownloader
+
+- (void)cancelDownloading:(id)execution {
+    %orig;
+    YTMFixCancelActiveItem();
+}
+
+%end
 
 %hook ELMTouchCommandPropertiesHandler
 
@@ -298,6 +425,9 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
         class_getInstanceMethod(handlerClass,
                                 @selector(downloadTrackWithVideoId:title:playlistName:completion:)) != NULL;
     YTMFixLog(@"bulk hook selector available=%@", hasBulkPath ? @"yes" : @"no");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        YTMFixInstallAncestorHelperHook();
+    });
 }
 
 
