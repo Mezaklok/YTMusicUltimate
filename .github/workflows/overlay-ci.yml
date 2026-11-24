@@ -53,3 +53,10 @@ jobs:
           cd OfflineFix
           make clean package DEBUG=0 FINALPACKAGE=1
 
+      - name: Upload overlay package
+        uses: actions/upload-artifact@v4
+        with:
+          name: YTMOfflineStabilityFix-deb
+          path: OfflineFix/packages/*.deb
+          if-no-files-found: error
+          retention-days: 7
