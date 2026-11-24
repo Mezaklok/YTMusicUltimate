@@ -103,6 +103,19 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
 
 %end
 
+// The installed bulk downloader walks arbitrary playlist objects and may
+// misclassify an NSProxy as a view controller before sending it -view.
+// Returning nil keeps that defensive traversal from raising an uncaught
+// unrecognized-selector exception; real UIViewController instances are not
+// affected.
+%hook NSProxy
+
+- (id)view {
+    return nil;
+}
+
+%end
+
 %hook FFMpegDownloader
 
 - (BOOL)downloadAudioSynchronous:(NSString *)audioURL {
