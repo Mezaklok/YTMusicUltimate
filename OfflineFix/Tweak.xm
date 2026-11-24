@@ -14,7 +14,13 @@ static BOOL YTMFixQueuePaused;
 typedef id (*YTMFixAncestorHelperType)(id object, id visited, NSUInteger depth);
 static YTMFixAncestorHelperType YTMFixOriginalAncestorHelper;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern void MSHookFunction(void *symbol, void *replace, void **result);
+#ifdef __cplusplus
+}
+#endif
 
 static dispatch_queue_t YTMFixLogQueue(void) {
     static dispatch_queue_t queue;
