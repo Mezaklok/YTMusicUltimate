@@ -10,6 +10,7 @@
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
 static YTMFixDownloadItem *YTMFixActiveDownloadItem;
 static BOOL YTMFixQueuePaused;
+static BOOL YTMFixAncestorHelperHookInstalled;
 
 typedef id (*YTMFixAncestorHelperType)(id object, id visited, NSUInteger depth);
 static YTMFixAncestorHelperType YTMFixOriginalAncestorHelper;
@@ -88,6 +89,10 @@ static BOOL YTMFixClassIsSubclassOf(Class cls, Class parent) {
 // check. Replace that one helper by address, rather than changing NSProxy
 // globally, and only traverse concrete UIKit/Foundation container types.
 static id YTMFixSafeAncestorHelper(id object, NSMutableSet *visited, NSUInteger depth) {
+    static dispatch_once_t firstInvocation;
+    dispatch_once(&firstInvocation, ^{
+        YTMFixLog(@"safe ancestor helper entered; targeted hook is active");
+    });
     if (object == nil || depth > 12) return nil;
 
     Class objectClass = object_getClass(object);
@@ -157,19 +162,24 @@ static void YTMFixInstallAncestorHelperHook(void) {
         if (imageName == NULL || strstr(imageName, "/YTMusicUltimate.dylib") == NULL) continue;
 
         uintptr_t targetAddress = (uintptr_t)_dyld_get_image_header(index) + 0xe10c;
-        uint32_t signature = *(uint32_t *)targetAddress;
-        uint32_t viewCallSignature = *(uint32_t *)(targetAddress + (0xebdc - 0xe10c));
-        if (signature != 0xa9ba6ffc || viewCallSignature != 0xa94b2e94) {
-            YTMFixLog(@"safe ancestor hook skipped signatures=%08x/%08x",
-                      signature, viewCallSignature);
+        // Compare instruction bytes, rather than host-endian integer values.
+        // The view call at 0xebdc is a BL instruction encoded as a9 4b 2e 94.
+        static const uint8_t helperPrologue[] = { 0xfc, 0x6f, 0xba, 0xa9 };
+        static const uint8_t viewCall[] = { 0xa9, 0x4b, 0x2e, 0x94 };
+        const void *viewCallAddress = (const void *)(targetAddress + (0xebdc - 0xe10c));
+        if (memcmp((const void *)targetAddress, helperPrologue, sizeof(helperPrologue)) != 0 ||
+            memcmp(viewCallAddress, viewCall, sizeof(viewCall)) != 0) {
+            YTMFixLog(@"safe ancestor hook skipped: unexpected target instructions");
             return;
         }
 
         MSHookFunction((void *)targetAddress,
                        (void *)YTMFixSafeAncestorHelper,
                        (void **)&YTMFixOriginalAncestorHelper);
+        YTMFixAncestorHelperHookInstalled = YES;
         installed = YES;
-        YTMFixLog(@"safe ancestor helper installed offset=0xe10c");
+        YTMFixLog(@"safe ancestor helper installed offset=0xe10c active=%@",
+                  YTMFixAncestorHelperHookInstalled ? @"yes" : @"no");
         return;
     }
     YTMFixLog(@"safe ancestor helper target not found");
