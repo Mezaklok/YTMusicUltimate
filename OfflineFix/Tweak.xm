@@ -1,25 +1,47 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <stdarg.h>
 
+@class YTMFixDownloadItem;
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
-static const void *YTMFixLastProgressTimeKey = &YTMFixLastProgressTimeKey;
+static YTMFixDownloadItem *YTMFixActiveDownloadItem;
 
-static dispatch_semaphore_t YTMFixFFmpegSemaphore(void) {
-    static dispatch_semaphore_t semaphore;
+static dispatch_queue_t YTMFixLogQueue(void) {
+    static dispatch_queue_t queue;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        semaphore = dispatch_semaphore_create(1);
+        queue = dispatch_queue_create("com.ytmusicultimate.offlinefix.log", DISPATCH_QUEUE_SERIAL);
     });
-    return semaphore;
+    return queue;
 }
 
-static NSMutableSet<NSString *> *YTMFixPendingVideoIDs(void) {
-    static NSMutableSet<NSString *> *videoIDs;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        videoIDs = [NSMutableSet set];
+static void YTMFixLog(NSString *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+    if (message.length == 0) return;
+
+    dispatch_async(YTMFixLogQueue(), ^{
+        NSURL *documentsURL = [[[NSFileManager defaultManager]
+            URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
+        NSURL *directoryURL = [documentsURL URLByAppendingPathComponent:@"YTMusicUltimate" isDirectory:YES];
+        [[NSFileManager defaultManager] createDirectoryAtURL:directoryURL
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:nil];
+        NSURL *logURL = [directoryURL URLByAppendingPathComponent:@"YTMOfflineStabilityFix.queue.log"];
+        NSString *oldContents = [NSString stringWithContentsOfURL:logURL
+                                                           encoding:NSUTF8StringEncoding
+                                                              error:nil] ?: @"";
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                          [[NSDate date] descriptionWithLocale:nil], message];
+        NSString *contents = [oldContents stringByAppendingString:line];
+        if (contents.length > 262144) {
+            contents = [contents substringFromIndex:(contents.length - 131072)];
+        }
+        [contents writeToURL:logURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
-    return videoIDs;
 }
 
 static NSMutableDictionary<NSString *, NSNumber *> *YTMFixMutableCompletionDates(void) {
@@ -68,7 +90,6 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
     %orig;
 
     id downloadsController = (id)self;
-
     id selectedPlaylist = nil;
     @try {
         selectedPlaylist = [downloadsController valueForKey:@"selectedPlaylistFilter"];
@@ -103,44 +124,109 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
 
 %end
 
-// The installed bulk downloader walks arbitrary playlist objects and may
-// misclassify an NSProxy as a view controller before sending it -view.
-// Returning nil keeps that defensive traversal from raising an uncaught
-// unrecognized-selector exception; real UIViewController instances are not
-// affected.
-%hook NSProxy
+@interface YTMFixDownloadItem : NSObject
+@property(nonatomic, copy) NSString *videoId;
+@property(nonatomic, copy) void (^start)(void);
+@property(nonatomic, copy) void (^completion)(void);
+@property(nonatomic, assign) BOOL finished;
+@property(nonatomic, assign) NSUInteger sequence;
+@end
 
-- (id)view {
-    return nil;
+@implementation YTMFixDownloadItem
+@end
+
+static dispatch_queue_t YTMFixQueueStateQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.ytmusicultimate.offlinefix.queue", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
 }
 
-%end
-
-%hook FFMpegDownloader
-
-- (BOOL)downloadAudioSynchronous:(NSString *)audioURL {
-    dispatch_semaphore_wait(YTMFixFFmpegSemaphore(), DISPATCH_TIME_FOREVER);
-    BOOL success = NO;
-    @try {
-        success = %orig;
-    } @finally {
-        dispatch_semaphore_signal(YTMFixFFmpegSemaphore());
-    }
-    return success;
+static NSMutableArray<YTMFixDownloadItem *> *YTMFixDownloadQueue(void) {
+    static NSMutableArray<YTMFixDownloadItem *> *items;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        items = [NSMutableArray array];
+    });
+    return items;
 }
 
-- (void)statisticsCallback:(id)statistics {
-    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    NSNumber *lastValue = objc_getAssociatedObject(self, YTMFixLastProgressTimeKey);
-    if (lastValue != nil && now - lastValue.doubleValue < 0.25) return;
-    objc_setAssociatedObject(self, YTMFixLastProgressTimeKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    %orig;
+static NSMutableSet<NSString *> *YTMFixQueuedVideoIDs(void) {
+    static NSMutableSet<NSString *> *videoIDs;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        videoIDs = [NSMutableSet set];
+    });
+    return videoIDs;
 }
 
-- (void)logCallback:(long)executionId :(int)level :(NSString *)message {
+static YTMFixDownloadItem *YTMFixActiveItem(void) {
+    return YTMFixActiveDownloadItem;
 }
 
-%end
+static void YTMFixSetActiveItem(YTMFixDownloadItem *item) {
+    YTMFixActiveDownloadItem = item;
+}
+
+static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason);
+
+static void YTMFixStartNextItem(void) {
+    if (YTMFixActiveItem() != nil || YTMFixDownloadQueue().count == 0) return;
+
+    YTMFixDownloadItem *item = YTMFixDownloadQueue().firstObject;
+    YTMFixSetActiveItem(item);
+    YTMFixLog(@"queue start seq=%lu pending=%lu", (unsigned long)item.sequence,
+              (unsigned long)YTMFixDownloadQueue().count);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (item.start) item.start();
+        } @catch (NSException *exception) {
+            YTMFixLog(@"queue exception seq=%lu name=%@", (unsigned long)item.sequence, exception.name);
+            YTMFixFinishItem(item, @"exception");
+            return;
+        }
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * 60 * NSEC_PER_SEC)),
+                       YTMFixQueueStateQueue(), ^{
+            if (!item.finished) {
+                YTMFixLog(@"queue timeout seq=%lu", (unsigned long)item.sequence);
+                YTMFixFinishItem(item, @"timeout");
+            }
+        });
+    });
+}
+
+static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
+    dispatch_async(YTMFixQueueStateQueue(), ^{
+        if (item.finished) return;
+        item.finished = YES;
+        if (YTMFixDownloadQueue().firstObject == item) {
+            [YTMFixDownloadQueue() removeObjectAtIndex:0];
+        } else {
+            [YTMFixDownloadQueue() removeObject:item];
+        }
+        [YTMFixQueuedVideoIDs() removeObject:item.videoId];
+        YTMFixLog(@"queue finish seq=%lu reason=%@ remaining=%lu",
+                  (unsigned long)item.sequence, reason,
+                  (unsigned long)YTMFixDownloadQueue().count);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                if (item.completion) item.completion();
+            } @catch (NSException *exception) {
+                YTMFixLog(@"completion exception seq=%lu name=%@",
+                          (unsigned long)item.sequence, exception.name);
+            }
+            dispatch_async(YTMFixQueueStateQueue(), ^{
+                if (YTMFixActiveItem() == item) YTMFixSetActiveItem(nil);
+                YTMFixStartNextItem();
+            });
+        });
+    });
+}
 
 %hook ELMTouchCommandPropertiesHandler
 
@@ -153,22 +239,62 @@ static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
         return;
     }
 
-    @synchronized (YTMFixPendingVideoIDs()) {
-        if ([YTMFixPendingVideoIDs() containsObject:videoId]) {
-            if (completion) completion();
+    dispatch_async(YTMFixQueueStateQueue(), ^{
+        if ([YTMFixQueuedVideoIDs() containsObject:videoId]) {
+            YTMFixLog(@"queue duplicate idLength=%lu pending=%lu",
+                      (unsigned long)videoId.length,
+                      (unsigned long)YTMFixDownloadQueue().count);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (completion) completion();
+                } @catch (NSException *exception) {
+                    YTMFixLog(@"duplicate completion exception name=%@", exception.name);
+                }
+            });
             return;
         }
-        [YTMFixPendingVideoIDs() addObject:videoId];
-    }
 
-    void (^wrappedCompletion)(void) = ^{
-        @synchronized (YTMFixPendingVideoIDs()) {
-            [YTMFixPendingVideoIDs() removeObject:videoId];
-        }
-        if (completion) completion();
-    };
-    %orig(videoId, title, playlistName, wrappedCompletion);
+        YTMFixDownloadItem *item = [YTMFixDownloadItem new];
+        item.videoId = [videoId copy];
+        item.sequence = YTMFixDownloadQueue().count + 1;
+        item.completion = [completion copy];
+        __weak YTMFixDownloadItem *weakItem = item;
+        item.start = ^{
+            YTMFixDownloadItem *strongItem = weakItem;
+            if (!strongItem) return;
+            %orig(videoId, title, playlistName, ^{
+                YTMFixFinishItem(strongItem, @"completion");
+            });
+        };
+        [YTMFixQueuedVideoIDs() addObject:videoId];
+        [YTMFixDownloadQueue() addObject:item];
+        YTMFixLog(@"queue enqueue seq=%lu pending=%lu idLength=%lu",
+                  (unsigned long)item.sequence,
+                  (unsigned long)YTMFixDownloadQueue().count,
+                  (unsigned long)videoId.length);
+        YTMFixStartNextItem();
+    });
 }
 
 %end
+
+%ctor {
+    YTMFixLog(@"overlay loaded");
+    NSArray<NSString *> *classNames = @[
+        @"YTMDownloadMetadata",
+        @"YTMDownloads",
+        @"ELMTouchCommandPropertiesHandler",
+        @"FFMpegDownloader"
+    ];
+    for (NSString *className in classNames) {
+        Class cls = objc_getClass(className.UTF8String);
+        YTMFixLog(@"class %@ available=%@", className, cls ? @"yes" : @"no");
+    }
+    Class handlerClass = objc_getClass("ELMTouchCommandPropertiesHandler");
+    BOOL hasBulkPath = handlerClass != Nil &&
+        class_getInstanceMethod(handlerClass,
+                                @selector(downloadTrackWithVideoId:title:playlistName:completion:)) != NULL;
+    YTMFixLog(@"bulk hook selector available=%@", hasBulkPath ? @"yes" : @"no");
+}
+
 
