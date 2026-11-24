@@ -152,8 +152,10 @@ static void YTMFixInstallAncestorHelperHook(void) {
 
         uintptr_t targetAddress = (uintptr_t)_dyld_get_image_header(index) + 0xe10c;
         uint32_t signature = *(uint32_t *)targetAddress;
-        if (signature != 0xa9ba6ffc) {
-            YTMFixLog(@"safe ancestor hook skipped signature=%08x", signature);
+        uint32_t viewCallSignature = *(uint32_t *)(targetAddress + (0xebdc - 0xe10c));
+        if (signature != 0xa9ba6ffc || viewCallSignature != 0xa94b2e94) {
+            YTMFixLog(@"safe ancestor hook skipped signatures=%08x/%08x",
+                      signature, viewCallSignature);
             return;
         }
 
