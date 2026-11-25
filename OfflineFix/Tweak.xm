@@ -5,7 +5,7 @@
 
 @class YTMFixDownloadItem;
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
-static NSString *const YTMFixBuildMarker = @"Offline Stability Fix: V6 · build-time helper patch";
+static NSString *const YTMFixBuildMarker = @"Offline Stability Fix: V7 · playlist context resolver";
 static YTMFixDownloadItem *YTMFixActiveDownloadItem;
 static BOOL YTMFixQueuePaused;
 
@@ -45,6 +45,95 @@ static void YTMFixLog(NSString *format, ...) {
         }
         [contents writeToURL:logURL atomically:YES encoding:NSUTF8StringEncoding error:nil];
     });
+}
+
+static BOOL YTMFixIsProxyObject(id object) {
+    if (object == nil) return NO;
+    Class proxyClass = [NSProxy class];
+    for (Class cls = object_getClass(object); cls != Nil; cls = class_getSuperclass(cls)) {
+        if (cls == proxyClass) return YES;
+    }
+    return NO;
+}
+
+static NSString *YTMFixPlaylistIDFromString(NSString *value) {
+    if (![value isKindOfClass:[NSString class]]) return nil;
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:
+        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return nil;
+
+    NSRange listRange = [trimmed rangeOfString:@"list="];
+    if (listRange.location != NSNotFound) {
+        NSUInteger start = NSMaxRange(listRange);
+        NSCharacterSet *terminators = [NSCharacterSet characterSetWithCharactersInString:@"&#? \t\r\n\"'<>" ];
+        NSRange tail = NSMakeRange(start, trimmed.length - start);
+        NSRange end = [trimmed rangeOfCharacterFromSet:terminators options:0 range:tail];
+        NSUInteger length = end.location == NSNotFound ? trimmed.length - start : end.location - start;
+        if (length > 0) trimmed = [trimmed substringWithRange:NSMakeRange(start, length)];
+    }
+
+    if (trimmed.length < 2 || trimmed.length > 256) return nil;
+    NSCharacterSet *invalid = [[NSCharacterSet characterSetWithCharactersInString:
+        @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-" ] invertedSet];
+    return [trimmed rangeOfCharacterFromSet:invalid].location == NSNotFound ? trimmed : nil;
+}
+
+static NSString *YTMFixResolvePlaylistID(id object, NSMutableSet<NSValue *> *visited, NSUInteger depth) {
+    if (object == nil || depth > 8 || YTMFixIsProxyObject(object)) return nil;
+
+    NSValue *identity = [NSValue valueWithNonretainedObject:object];
+    if ([visited containsObject:identity]) return nil;
+    [visited addObject:identity];
+
+    if ([object isKindOfClass:[NSString class]]) {
+        return YTMFixPlaylistIDFromString((NSString *)object);
+    }
+    if ([object isKindOfClass:[NSURL class]]) {
+        return YTMFixPlaylistIDFromString([(NSURL *)object absoluteString]);
+    }
+    if ([object isKindOfClass:[NSArray class]]) {
+        for (id value in (NSArray *)object) {
+            NSString *playlistID = YTMFixResolvePlaylistID(value, visited, depth + 1);
+            if (playlistID.length > 0) return playlistID;
+        }
+        return nil;
+    }
+    if ([object isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *dictionary = (NSDictionary *)object;
+        NSArray<NSString *> *preferredKeys = @[
+            @"playlistId", @"playlistID", @"browseId", @"browseID", @"list",
+            @"url", @"URL", @"canonicalURL", @"navigationEndpoint", @"browseEndpoint",
+            @"watchEndpoint", @"commandMetadata", @"webCommandMetadata"
+        ];
+        for (NSString *key in preferredKeys) {
+            NSString *playlistID = YTMFixResolvePlaylistID(dictionary[key], visited, depth + 1);
+            if (playlistID.length > 0) return playlistID;
+        }
+        return nil;
+    }
+
+    NSArray<NSString *> *keys = @[
+        @"playlistId", @"playlistID", @"browseId", @"browseID", @"list",
+        @"url", @"URL", @"canonicalURL", @"navigationEndpoint", @"browseEndpoint",
+        @"watchEndpoint", @"commandMetadata", @"webCommandMetadata", @"context"
+    ];
+    for (NSString *key in keys) {
+        id value = nil;
+        @try {
+            value = [object valueForKey:key];
+        } @catch (__unused NSException *exception) {
+            continue;
+        }
+        NSString *playlistID = YTMFixResolvePlaylistID(value, visited, depth + 1);
+        if (playlistID.length > 0) return playlistID;
+    }
+    return nil;
+}
+
+static NSString *YTMFixResolvePlaylistID(id primary, id secondary) {
+    NSMutableSet<NSValue *> *visited = [NSMutableSet set];
+    NSString *playlistID = YTMFixResolvePlaylistID(primary, visited, 0);
+    return playlistID.length > 0 ? playlistID : YTMFixResolvePlaylistID(secondary, visited, 0);
 }
 
 static NSMutableDictionary<NSString *, NSNumber *> *YTMFixMutableCompletionDates(void) {
@@ -272,6 +361,28 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
 
 %hook ELMTouchCommandPropertiesHandler
 
+- (void)downloadPlaylistTracks:(id)source
+                       context:(id)context
+    saveAsCustomOfflinePlaylist:(BOOL)saveAsCustomOfflinePlaylist {
+    const char *sourceClass = source ? class_getName(object_getClass(source)) : "nil";
+    const char *contextClass = context ? class_getName(object_getClass(context)) : "nil";
+    NSString *playlistID = YTMFixResolvePlaylistID(context, source);
+    YTMFixLog(@"playlist context sourceClass=%s contextClass=%s resolved=%@ mode=%@",
+              sourceClass ?: "unknown", contextClass ?: "unknown",
+              playlistID.length > 0 ? @"yes" : @"no",
+              saveAsCustomOfflinePlaylist ? @"custom" : @"separate");
+
+    // Supplying the already resolved identifier lets the original fetcher keep
+    // its title, pagination and track ordering logic without traversing a
+    // controller's view hierarchy. That traversal is the path which reaches
+    // the NSProxy in the unmodified tweak.
+    if (playlistID.length > 0) {
+        %orig(source, playlistID, saveAsCustomOfflinePlaylist);
+    } else {
+        %orig;
+    }
+}
+
 - (void)downloadTrackWithVideoId:(NSString *)videoId
                            title:(NSString *)title
                     playlistName:(NSString *)playlistName
@@ -338,6 +449,11 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
         class_getInstanceMethod(handlerClass,
                                 @selector(downloadTrackWithVideoId:title:playlistName:completion:)) != NULL;
     YTMFixLog(@"bulk hook selector available=%@", hasBulkPath ? @"yes" : @"no");
+    BOOL hasPlaylistContextPath = handlerClass != Nil &&
+        class_getInstanceMethod(handlerClass,
+                                @selector(downloadPlaylistTracks:context:saveAsCustomOfflinePlaylist:)) != NULL;
+    YTMFixLog(@"playlist context hook selector available=%@",
+              hasPlaylistContextPath ? @"yes" : @"no");
 }
 
 
