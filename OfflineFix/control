@@ -1,0 +1,10 @@
+Package: com.mezaklok.ytmofflinestabilityfix
+Name: YTMOfflineStabilityFix
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Offline download ordering and stability fixes for YTMusicUltimate
+Maintainer: Mezaklok
+Author: Mezaklok
+Section: Tweaks
+Depends: mobilesubstrate
+

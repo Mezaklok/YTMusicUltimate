@@ -16,7 +16,7 @@ on:
 
       bundle_id:
         description: "BundleID (Optional)"
-        default: "com.google.ios.youtubemusic"
+        default: "com.google.ios.youtubemusic.M6LBXSF492"
         required: true
         type: string
 
@@ -26,10 +26,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build YTMusicUltimate
+    name: Build offline stability overlay
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout Main
@@ -96,22 +96,20 @@ jobs:
       - name: Download YouTube Music
         run: wget "${{ inputs.ipa_url }}" --no-verbose -O ytm.ipa
 
-      - name: Build Tweak for Sideloading
+      - name: Build offline stability overlay
         run: |
-          cd main
+          cd main/OfflineFix
           make clean package DEBUG=0 FINALPACKAGE=1 SIDELOADING=1
-          mv packages/*.deb ../ytmult.deb
+          mv packages/*.deb ../../ytm-offline-fix.deb
 
-      - name: Inject tweak into provided IPA
-        run: cyan -i ytm.ipa -o YTMusicUltimate.ipa -uwsf ytmult.deb -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }} 
+      - name: Inject overlay without replacing existing tweaks
+        run: cyan -i ytm.ipa -o YTMusicUltimate.ipa -uwsf ytm-offline-fix.deb -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }}
 
-      - name: Create Release
-        uses: softprops/action-gh-release@v2.5.0
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: YTMusicUltimate (${{ github.run_number }})
-          files: YTMusicUltimate.ipa
-          draft: true
+          name: YTMusicUltimate-${{ github.run_number }}
+          path: YTMusicUltimate.ipa
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Output Release URL
-        run: |
-          echo "::notice::Release available at: https://github.com/${{ github.repository }}/releases"
