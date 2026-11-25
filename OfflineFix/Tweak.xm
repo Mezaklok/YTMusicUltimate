@@ -2,27 +2,12 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #include <stdarg.h>
-#include <mach-o/dyld.h>
-#include <stdint.h>
-#include <string.h>
 
 @class YTMFixDownloadItem;
 static NSString *const YTMFixCompletionDatesKey = @"YTMOfflineFixCompletionDates";
-static NSString *const YTMFixBuildMarker = @"Offline Stability Fix: V5 · hook-active check";
+static NSString *const YTMFixBuildMarker = @"Offline Stability Fix: V6 · build-time helper patch";
 static YTMFixDownloadItem *YTMFixActiveDownloadItem;
 static BOOL YTMFixQueuePaused;
-static BOOL YTMFixAncestorHelperHookInstalled;
-
-typedef id (*YTMFixAncestorHelperType)(id object, id visited, NSUInteger depth);
-static YTMFixAncestorHelperType YTMFixOriginalAncestorHelper;
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern void MSHookFunction(void *symbol, void *replace, void **result);
-#ifdef __cplusplus
-}
-#endif
 
 static dispatch_queue_t YTMFixLogQueue(void) {
     static dispatch_queue_t queue;
@@ -75,115 +60,6 @@ static void YTMFixRecordCompletion(NSString *fileName) {
         dates[fileName] = @([NSDate date].timeIntervalSince1970);
         [[NSUserDefaults standardUserDefaults] setObject:dates forKey:YTMFixCompletionDatesKey];
     }
-}
-
-static BOOL YTMFixClassIsSubclassOf(Class cls, Class parent) {
-    if (cls == Nil || parent == Nil) return NO;
-    for (Class current = cls; current != Nil; current = class_getSuperclass(current)) {
-        if (current == parent) return YES;
-    }
-    return NO;
-}
-
-// The installed YTMusicUltimate helper at offset 0xe10c recursively searches
-// arbitrary objects and eventually sends -view after a loose respondsToSelector:
-// check. Replace that one helper by address, rather than changing NSProxy
-// globally, and only traverse concrete UIKit/Foundation container types.
-static id YTMFixSafeAncestorHelper(id object, NSMutableSet *visited, NSUInteger depth) {
-    static dispatch_once_t firstInvocation;
-    dispatch_once(&firstInvocation, ^{
-        YTMFixLog(@"safe ancestor helper entered; targeted hook is active");
-    });
-    if (object == nil || depth > 12) return nil;
-
-    Class objectClass = object_getClass(object);
-    if (objectClass == Nil) return nil;
-
-    NSValue *marker = [NSValue valueWithPointer:(__bridge const void *)object];
-    if (visited != nil && [visited containsObject:marker]) return nil;
-    if (visited != nil) [visited addObject:marker];
-
-    if (YTMFixClassIsSubclassOf(objectClass, [NSProxy class])) {
-        YTMFixLog(@"safe ancestor skipped NSProxy depth=%lu", (unsigned long)depth);
-        return nil;
-    }
-    if (YTMFixClassIsSubclassOf(objectClass, [UIViewController class])) {
-        Method viewMethod = class_getInstanceMethod(objectClass, @selector(view));
-        if (viewMethod != NULL) return object;
-        YTMFixLog(@"safe ancestor skipped controller without view method depth=%lu",
-                  (unsigned long)depth);
-        return nil;
-    }
-
-    SEL rootSelector = @selector(rootViewController);
-    if (YTMFixClassIsSubclassOf(objectClass, [UIWindow class])) {
-        Method rootMethod = class_getInstanceMethod(objectClass, rootSelector);
-        IMP rootImplementation = rootMethod ? method_getImplementation(rootMethod) : NULL;
-        if (rootImplementation != NULL) {
-            id root = ((id (*)(id, SEL))rootImplementation)(object, rootSelector);
-            return YTMFixSafeAncestorHelper(root, visited, depth + 1);
-        }
-        return nil;
-    }
-
-    SEL responderSelector = @selector(nextResponder);
-    if (YTMFixClassIsSubclassOf(objectClass, [UIView class])) {
-        Method responderMethod = class_getInstanceMethod(objectClass, responderSelector);
-        IMP responderImplementation = responderMethod ? method_getImplementation(responderMethod) : NULL;
-        if (responderImplementation != NULL) {
-            id responder = ((id (*)(id, SEL))responderImplementation)(object, responderSelector);
-            return YTMFixSafeAncestorHelper(responder, visited, depth + 1);
-        }
-        return nil;
-    }
-
-    if (YTMFixClassIsSubclassOf(objectClass, [NSDictionary class])) {
-        for (id value in [(NSDictionary *)object allValues]) {
-            id result = YTMFixSafeAncestorHelper(value, visited, depth + 1);
-            if (result != nil) return result;
-        }
-        return nil;
-    }
-    if (YTMFixClassIsSubclassOf(objectClass, [NSArray class]) ||
-        YTMFixClassIsSubclassOf(objectClass, [NSSet class])) {
-        for (id value in (id<NSFastEnumeration>)object) {
-            id result = YTMFixSafeAncestorHelper(value, visited, depth + 1);
-            if (result != nil) return result;
-        }
-    }
-    return nil;
-}
-
-static void YTMFixInstallAncestorHelperHook(void) {
-    static BOOL installed;
-    if (installed) return;
-
-    for (uint32_t index = 0; index < _dyld_image_count(); index++) {
-        const char *imageName = _dyld_get_image_name(index);
-        if (imageName == NULL || strstr(imageName, "/YTMusicUltimate.dylib") == NULL) continue;
-
-        uintptr_t targetAddress = (uintptr_t)_dyld_get_image_header(index) + 0xe10c;
-        // Compare instruction bytes, rather than host-endian integer values.
-        // The view call at 0xebdc is a BL instruction encoded as a9 4b 2e 94.
-        static const uint8_t helperPrologue[] = { 0xfc, 0x6f, 0xba, 0xa9 };
-        static const uint8_t viewCall[] = { 0xa9, 0x4b, 0x2e, 0x94 };
-        const void *viewCallAddress = (const void *)(targetAddress + (0xebdc - 0xe10c));
-        if (memcmp((const void *)targetAddress, helperPrologue, sizeof(helperPrologue)) != 0 ||
-            memcmp(viewCallAddress, viewCall, sizeof(viewCall)) != 0) {
-            YTMFixLog(@"safe ancestor hook skipped: unexpected target instructions");
-            return;
-        }
-
-        MSHookFunction((void *)targetAddress,
-                       (void *)YTMFixSafeAncestorHelper,
-                       (void **)&YTMFixOriginalAncestorHelper);
-        YTMFixAncestorHelperHookInstalled = YES;
-        installed = YES;
-        YTMFixLog(@"safe ancestor helper installed offset=0xe10c active=%@",
-                  YTMFixAncestorHelperHookInstalled ? @"yes" : @"no");
-        return;
-    }
-    YTMFixLog(@"safe ancestor helper target not found");
 }
 
 static NSDate *YTMFixCompletionDate(NSString *fileName, NSURL *downloadsURL) {
@@ -462,9 +338,6 @@ static void YTMFixFinishItem(YTMFixDownloadItem *item, NSString *reason) {
         class_getInstanceMethod(handlerClass,
                                 @selector(downloadTrackWithVideoId:title:playlistName:completion:)) != NULL;
     YTMFixLog(@"bulk hook selector available=%@", hasBulkPath ? @"yes" : @"no");
-    dispatch_async(dispatch_get_main_queue(), ^{
-        YTMFixInstallAncestorHelperHook();
-    });
 }
 
 
